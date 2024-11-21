@@ -10,271 +10,338 @@
 
 using namespace std;
 
-class Memory_allocator {
+class Memory_allocator
+{
 private:
-    bool initialized = false;   // Флаг инициализации
-     
+    bool is_int = false;
+
+    map<size_t, size_t> blocks_FSA = { {16, 10}, {32, 10}, {64, 10}, {128, 10}, {256, 10}, {512, 10} };
     map<size_t, vector<void*>> pools_FSA;
 
-    // Блок для Coalesce Allocation
-    struct Block 
+    // Структура описания блока для CA
+    struct Block_CA
     {
-        bool free;
-        size_t size;
-        Block* next;
-        Block* prev;
+        bool is_free;      
+        size_t size;   
+        Block_CA* next;  
+        Block_CA* prev; 
     };
 
-    Block* Head_of_list = nullptr;      // Головной блок для Coalesce Allocation
+    Block_CA* head_of_list = nullptr; 
+    size_t memory_for_coalesce = 4096; 
 
-    vector<void*> pools_OS;             // Список указателей на память, выделенную у ОС
-
-    //
-    void merge_free_blocks(Block* block) 
+    // Структура для описания блока, выделенного у ОС
+    struct Block_OS
     {
-        if (block->prev && block->prev->free) 
-        {
-            block->prev->size += block->size + sizeof(Block);
-            block->prev->next = block->next;
+        void* ptr;         
+        size_t size;        
+    };
 
-            if (block->next) {
-                block->next->prev = block->prev;
+    size_t limit_to_call_os = 10 * 1024 * 1024;
+    vector<Block_OS> pools_OS;
+
+    // Метод объединения соседних свободных блоков в CA
+    void merge_free_blocks(Block_CA* block)
+    {
+        // Если предыдущий блок свободен, объединяем его с текущим
+        if (block->prev && block->prev->is_free)
+        {
+            // Увеличиваем размер предыдущего блока
+            block->prev->size += block->size + sizeof(Block_CA); 
+            // Пропускаем текущий блок в списке
+            block->prev->next = block->next; 
+
+            if (block->next)
+            {
+                // Обновляем указатель на предыдущий у следующего блока
+                block->next->prev = block->prev; 
             }
 
+            // Смещаем текущий блок на предыдущий
             block = block->prev;
         }
 
-        if (block->next && block->next->free) 
+        // Если следующий блок свободен, объединяем его с текущим (Логика аналогичная)
+        if (block->next && block->next->is_free)
         {
-            block->size += block->next->size + sizeof(Block);
+            block->size += block->next->size + sizeof(Block_CA);
             block->next = block->next->next;
 
-            if (block->next) {
+            if (block->next)
+            {
                 block->next->prev = block;
             }
         }
     }
 
 public:
-    size_t limit_to_call_os = 10 * 1024 * 1024;
-
-    // Количество блоков для каждого размера FSA (размер; количество блоков)
-    map<size_t, size_t> blocks_FSA = { {16, 10}, {32, 10}, {64, 10}, {128, 10}, {256, 10}, {512, 10} };
-
-    size_t memory_for_coalesce = 4096;     // Лимит памяти для Coalesce Allocation
-
     Memory_allocator() = default;
 
-    ~Memory_allocator() {
-        assert(!initialized && "Destroy must be called before destructor!");
-        if (initialized) {
+    ~Memory_allocator()
+    {
+        assert(!is_int && "Destroy must be called before destructor!");
+
+        if (is_int)
+        {
             destroy();
         }
     }
 
+    // Инициализация аллокатора: выделение памяти для FSA и CA
     void init()
     {
-        assert(!initialized && "Allocator already initialized!");
+        assert(!is_int && "Allocator already initialized!");
 
-        if (!initialized)
+        if (!is_int)
         {
-            // Инициализация FSA
-            for (const auto& [blockSize, count] : blocks_FSA)
+            // Инициализация пулов FSA
+            for (const auto& [size, count] : blocks_FSA)
             {
-                vector<void*>& pool = pools_FSA[blockSize];
+                vector<void*>& pool = pools_FSA[size];
 
-                for (size_t i = 0; i < count; ++i) {
-                    pool.push_back(malloc(blockSize));
+                for (size_t i = 0; i < count; ++i)
+                {
+                    void* block = malloc(size);
+
+                    if (!block) {
+                        throw runtime_error("Memory allocation failed for FSA block");
+                    }
+
+                    pool.push_back(block);
                 }
             }
 
-            // Выделение памяти для Coalesce Allocation
-            void* coalesceMemory = malloc(memory_for_coalesce);
-            assert(coalesceMemory && "Failed to allocate memory for Coalesce Allocation");
+            // Инициализация списка CA
+            void* memory_CA = malloc(memory_for_coalesce);
 
-            // Создаем начальный блок
-            Head_of_list = static_cast<Block*>(coalesceMemory);
-            Head_of_list->size = memory_for_coalesce - sizeof(Block);
-            Head_of_list->free = true;
-            Head_of_list->next = nullptr;
-            Head_of_list->prev = nullptr;
+            if (!memory_CA) {
+                throw std::runtime_error("Memory allocation failed for Coalesced Allocator");
+            }
 
-            initialized = true;
+            // Приводим указатель к типу Block_CA с помощью reinterpret_cast
+            // reinterpret_cast позволяет выполнять низкоуровневое преобразование типов
+            head_of_list = static_cast<Block_CA*>(memory_CA);
+            // Вычисляем размер доступной памяти
+            head_of_list->size = memory_for_coalesce - sizeof(Block_CA);
+            head_of_list->is_free = true;
+            head_of_list->next = nullptr;
+            head_of_list->prev = nullptr;
+
+
+            is_int = true;
         }
     }
 
-    void destroy() 
+    // Уничтожение аллокатора: освобождение памяти FSA, CA и ОС
+    void destroy()
     {
-        assert(initialized && "Allocator not initialized!");
+        assert(is_int && "Allocator not initialized!");
 
-        // Удаление FSA
-        for (auto& [blockSize, pool] : pools_FSA) {
-            for (void* block : pool) {
+        // Освобождение памяти FSA
+        for (auto& [size, pool] : pools_FSA)
+        {
+            for (void* block : pool)
+            {
                 free(block);
             }
         }
 
         pools_FSA.clear();
 
-        // Удаление Coalesce Allocation
-        Block* current = Head_of_list;
-
-        while (current) 
+        // Освобождение памяти CA
+        Block_CA* current = head_of_list;
+        while (current)
         {
-            Block* next = current->next;
+            Block_CA* next = current->next;
             free(current);
             current = next;
         }
+        head_of_list = nullptr;
 
-        Head_of_list = nullptr;
-
-        // Удаление блоков выделенных ОС
-        for (void* osMemory : pools_OS) 
+        // Освобождение памяти, выделенной у ОС
+        for (const Block_OS& block_os : pools_OS)
         {
-            if (!VirtualFree(osMemory, 0, MEM_RELEASE)) {
+            if (!VirtualFree(block_os.ptr, 0, MEM_RELEASE))
+            {
                 cerr << "VirtualFree failed with error: " << GetLastError() << "\n";
             }
         }
+
         pools_OS.clear();
 
-        initialized = false;
+
+        is_int = false;
     }
 
-    void* alloc(size_t size) 
+    // Выделение памяти заданного размера
+    void* alloc(size_t size)
     {
-        assert(initialized && "Allocator not initialized!");
+        assert(is_int && "Allocator not initialized!");
 
-        if (initialized)
+        // Выравнивание размера на границу 8 байт
+        size = (size + 7) & ~7; 
+
+        // Если размер соответствует FSA, пытаемся взять блок из пула
+        if (size == 16 || size == 32 || size == 64 || size == 128 || size == 256 || size == 512)
         {
-            size = (size + 7) & ~7; // Выравниваем размер по границе 8 байт
+            auto it = pools_FSA.find(size);
 
-            if (size == 512)
+            if (it != pools_FSA.end() && !it->second.empty())
             {
-                auto it = pools_FSA.find(size);
+                // Берем последний блок из пула
+                void* block = it->second.back(); 
+                // Убираем его из списка свободных
+                it->second.pop_back();
 
-                if (it != pools_FSA.end() && !it->second.empty())
-                {
-                    void* block = it->second.back();
-                    it->second.pop_back();
-
-                    return block;
-                }
+                return block;
             }
-            else if (size <= limit_to_call_os)
+        }
+        // Если размер подходит для CA
+        else if (size <= limit_to_call_os)
+        {
+            Block_CA* current = head_of_list;
+
+            while (current)
             {
-                Block* current = Head_of_list;
-
-                while (current)
+                if (current->is_free && current->size >= size)
                 {
-                    if (current->free && current->size >= size)
+                    current->is_free = false;
+
+                    // Разбиение блока, если остаток достаточно велик
+                    if (current->size > size + sizeof(Block_CA))
                     {
-                        current->free = false;
+                        Block_CA* newBlock = reinterpret_cast<Block_CA*>(reinterpret_cast<char*>(current) + sizeof(Block_CA) + size);
 
-                        // Разбиваем блок, если его размер значительно больше
-                        if (current->size > size + sizeof(Block)) {
-                            Block* newBlock = reinterpret_cast<Block*>(
-                                reinterpret_cast<char*>(current) + sizeof(Block) + size);
+                        // Вычисляем размер нового блока
+                        newBlock->size = current->size - size - sizeof(Block_CA);
+                        newBlock->is_free = true;
+                        newBlock->next = current->next;
+                        newBlock->prev = current;
 
-                            newBlock->size = current->size - size - sizeof(Block);
-                            newBlock->free = true;
-                            newBlock->next = current->next;
-                            newBlock->prev = current;
-
-                            if (current->next) current->next->prev = newBlock;
-                            current->next = newBlock;
-
-                            current->size = size;
+                        if (current->next)
+                        {
+                            current->next->prev = newBlock;
                         }
 
-                        return reinterpret_cast<void*>(current + 1);
+                        current->next = newBlock;
+                        current->size = size;
                     }
 
-                    current = current->next;
+                    return reinterpret_cast<void*>(current + 1);
                 }
+
+                current = current->next;
             }
-            else
+        }
+        else
+        {
+            // Если размер превышает лимит CA, выделяем память у ОС
+            void* memory_os = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+            if (!memory_os)
             {
-                void* osMemory = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                cerr << "VirtualAlloc failed with error: " << GetLastError() << "\n";
 
-                if (!osMemory) 
+                return nullptr;
+            }
+
+            pools_OS.push_back({ memory_os, size });
+
+            return memory_os;
+        }
+
+        // Если память не удалось выделить
+        return nullptr;
+    }
+
+    // Освобождение памяти
+    void free(void* ptr)
+    {
+        assert(is_int && "Allocator not initialized!");
+
+        if (!ptr)
+        {
+            return;
+        }
+
+        // Освобождение блока для FSA
+        for (auto& [size, pool] : pools_FSA)
+        {
+            for (void* block : pool)
+            {
+                if (ptr >= block && ptr < reinterpret_cast<void*>(reinterpret_cast<char*>(block) + size))
                 {
-                    cerr << "VirtualAlloc failed with error: " << GetLastError() << "\n";
-                    return nullptr;
+                    pool.push_back(ptr);
+
+                    return;
                 }
-
-                pools_OS.push_back(osMemory);
-
-                return osMemory;
             }
         }
 
-        return nullptr;     // Нет доступного блока
-    }
-
-    void free(void* ptr) 
-    {
-        assert(initialized && "Allocator not initialized!");
-
-        // Проверяем, принадлежит ли указатель FSA
-        for (const auto& [blockSize, pool] : pools_FSA) 
+        // Проверка принадлежности к CA
+        if (ptr > head_of_list && ptr < reinterpret_cast<void*>(reinterpret_cast<char*>(head_of_list) + memory_for_coalesce))
         {
-            if (!pool.empty() && ptr >= pool.front() && ptr <= pool.back()) 
+            Block_CA* block = reinterpret_cast<Block_CA*>(reinterpret_cast<char*>(ptr) - sizeof(Block_CA));
+            block->is_free = true;
+
+            merge_free_blocks(block);
+
+            return;
+        }
+
+        // Проверка принадлежности к памяти ОС
+        for (auto it = pools_OS.begin(); it != pools_OS.end(); ++it)
+        {
+            if (it->ptr == ptr)
             {
-                pools_FSA[blockSize].push_back(ptr);
+                if (!VirtualFree(it->ptr, 0, MEM_RELEASE))
+                {
+                    cerr << "VirtualFree failed with error: " << GetLastError() << "\n";
+                }
+
+                pools_OS.erase(it);
+
                 return;
             }
         }
-
-        // * Проверка, что указатель принадлежит Coalesce Allocation
-
-        Block* block = reinterpret_cast<Block*>(reinterpret_cast<char*>(ptr) - sizeof(Block));
-        block->free = true;
-
-        // Слияние свободных блоков
-        merge_free_blocks(block);
-
-        //* Проверка, что принадлежит ОС
-        //* Освобождение памяти ОС
     }
 
-#ifdef DEBUG
-    void dump_stat() const
+//#ifdef DEBUG
+    // Выводит в стандартный поток вывода статистику по аллокатору : количество занятых и свободных блоков, список блоков запрошенных у ОС и их размеры
+    void dump_stat() const 
     {
         cout << "Memory statistics:\n";
 
-
         cout << "Fixed-size Memory Allocation:\n";
 
-        for (const auto& [blockSize, pool] : pools_FSA)
+        for (const auto& [size, pool] : pools_FSA) 
         {
-            size_t totalBlocks = blocks_FSA.at(blockSize);
-            size_t freeBlocks = pool.size();
-            size_t occupiedBlocks = totalBlocks - freeBlocks;
+            size_t block_count = blocks_FSA.at(size);
+            size_t free_blocks = pool.size();
+            size_t occupied_blocks = block_count - free_blocks;
 
-            cout << "  Block size: " << blockSize
-                << ", Occupied: " << occupiedBlocks
-                << ", Free: " << freeBlocks << "\n";
+            cout << "  Block size: " << size << ", Occupied: " << occupied_blocks << ", Free: " << free_blocks << "\n";
         }
 
 
         cout << "Coalesce Allocation:\n";
 
-        size_t coalesceFree = 0, coalesceOccupied = 0;
-        Block* current = Head_of_list;
+        size_t blocks_free = 0, occupied_blocks = 0;
+        Block_CA* current = head_of_list;
 
-        while (current)
+        while (current) 
         {
-            if (current->free) {
-                coalesceFree++;
+            if (current->is_free) {
+                blocks_free++;
             }
             else {
-                coalesceOccupied++;
+                occupied_blocks++;
             }
 
             current = current->next;
         }
 
-        cout << "  Occupied: " << coalesceOccupied << ", Free: " << coalesceFree << "\n";
+        cout << "  Occupied: " << occupied_blocks << ", Free: " << blocks_free << "\n";
 
 
         cout << "OS Allocations:\n";
@@ -282,6 +349,7 @@ public:
         cout << "  Total blocks: " << pools_OS.size() << "\n";
     }
 
+    // Выводит в стандартный поток вывода список всех этим занятых блоков : их адреса и размеры
     void dump_blocks() const
     {
         cout << "Allocated blocks:\n";
@@ -289,36 +357,40 @@ public:
 
         cout << "Fixed-size Memory Allocation:\n";
 
-        for (const auto& [blockSize, pool] : pools_FSA) 
+        for (const auto& [size, pool] : pools_FSA)
         {
-            size_t totalBlocks = blocks_FSA.at(blockSize);
-            size_t occupiedBlocks = totalBlocks - pool.size();
+            size_t occupied_blocks = blocks_FSA.at(size) - pool.size();
 
-            cout << "  Block size: " << blockSize << "\n";
+            cout << "  Block size: " << size << "\n";
             cout << "    Occupied blocks:\n";
 
-            for (size_t i = 0; i < occupiedBlocks; ++i) {
-                cout << "      Block at " << pool[i] << "\n";
+            for (size_t i = 0; i < occupied_blocks; ++i)
+            {
+                void* block = pool[i];
+
+                cout << "      Block at " << block << ", size: " << size << "\n";
             }
         }
 
 
         cout << "Coalesce Allocation:\n";
 
-        Block* current = Head_of_list;
+        Block_CA* current = head_of_list;
 
-        while (current) 
+        while (current)
         {
-            cout << "  Block at " << current << ", size: " << current->size << ", " << (current->free ? "free" : "occupied") << "\n";
+            if (!current->is_free) {
+                cout << "  Block at " << current << ", size: " << current->size << "\n";
+            }
             current = current->next;
         }
 
 
         cout << "OS Allocations:\n";
 
-        for (const auto& [size, ptr] : pools_OS) {
+        for (const auto& [ptr, size] : pools_OS) {
             cout << "  Block at " << ptr << ", size: " << size << "\n";
         }
     }
-#endif
+//#endif
 };

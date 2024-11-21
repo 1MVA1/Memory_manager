@@ -9,10 +9,10 @@ int main()
     double* pd = (double*)allocator.alloc(sizeof(double));
     int* pa = (int*)allocator.alloc(10 * sizeof(int));
 
-#ifdef DEBUG
+//#ifdef DEBUG
     allocator.dump_stat();
     allocator.dump_blocks();
-#endif
+//#endif
 
     allocator.free(pa);
     allocator.free(pd);
