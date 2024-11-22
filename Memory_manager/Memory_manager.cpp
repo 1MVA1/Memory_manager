@@ -14,9 +14,9 @@ int main()
     allocator.dump_blocks();
 //#endif
 
-    allocator.free(pa);
-    allocator.free(pd);
-    allocator.free(pi);
+    allocator.free_(pa);
+    allocator.free_(pd);
+    allocator.free_(pi);
 
     allocator.destroy();
 
