@@ -1,66 +1,88 @@
 #pragma once
 
+//#ifdef DEBUG
 #include <iostream>
-#include <vector>
-#include <map>          // Для использования контейнера map
-#include <cassert>      // Для использования макроса assert для проверки корректности вызовов и состояния
-#include <cstdlib>      // Для malloc, free и приведения типов указателей
+//#endif
+
+#include <cassert>  
+#include <array>
 #include <windows.h>    // Для вызовов VirtualAlloc и VirtualFree при работе с памятью ОС
 
 using namespace std;
 
-// Универсальный менеджер памяти, который работает с тремя подходами к управлению памятью: Fixed-Size Allocator (FSA),
-// Coalesced Allocator (CA) и выделением памяти у операционной системы (OS allocation)
-// 
-//      FSA оптимизирует управление памятью для небольших блоков фиксированного размера 
-//          Выделение и освобождение блоков выполняются за O(1), поскольку это просто операции на указателях
-//          Блоки фиксированного размера устраняют внутреннюю фрагментацию
-//          Использование односвязного списка делает порядок освобождения блоков нерелевантным — они переиспользуются независимо от порядка возврата
+// Универсальный менеджер памяти, работающий с тремя подходами к управлению памятью: Fixed-Size Allocator (FSA), 
+// Coalesced Allocator (CA) и выделением памяти у операционной системы (OS allocation).
 //
-//      CA управляет памятью для блоков переменного размера, которые меньше лимита для обращения к ОС (limit_to_call_os)
-//          Память выделяется из заранее подготовленного большого блока (memory_for_coalesce), где свободные блоки хранятся как элементы двусвязного списка
-//          При освобождении соседние свободные блоки автоматически объединяются для минимизации фрагментации
-//          Если выделяется только часть свободного блока, оставшаяся память разрезается на новый свободный блок
-//          Подходит для распределения памяти с минимальной фрагментацией при невысоких запросах на размер
+// Fixed-Size Allocator (FSA):
+// - Операции выделения и освобождения памяти выполняются за O(1) благодаря использованию односвязного списка.
+// - Исключает внутреннюю фрагментацию за счет фиксированного размера блоков.
+// - Порядок освобождения блоков не влияет на производительность — блоки переиспользуются независимо.
 //
-//      OS управляет памятью для блоков, которые превышают лимит для CA
-//          Используются системные вызовы (VirtualAlloc) для выделения больших областей памяти
-//          Для освобождения памяти вызывается соответствующий системный вызов (VirtualFree)
-//          Каждый запрос памяти обрабатывается отдельно, без объединения или разделения
-//          Такие вызовы требуют больше времени по сравнению с FSA и CA, поэтому используются только для крупных запросов.      
+// Coalesced Allocator (CA):
+// - Управляет памятью для блоков переменного размера, которые меньше заданного предела (limit_to_call_os).
+// - Использует большой заранее выделенный блок памяти (memory_for_coalesce).
+// - Свободные блоки хранятся в двусвязном списке, что упрощает управление и объединение.
+// - При освобождении соседние свободные блоки автоматически объединяются, уменьшая фрагментацию.
+// - Если выделяемый размер меньше свободного блока, оставшаяся память становится новым свободным блоком.
+//
+// OS Allocation:
+// - Обрабатывает запросы памяти для больших блоков, превышающих заданный лимит (limit_to_call_os).
+// - Каждый запрос памяти обрабатывается индивидуально, без объединения или разделения блоков.
+// - Такие вызовы более затратны по времени, поэтому применяются только для крупных запросов.    
 class Memory_allocator
 {
 private:
-    bool is_int = false;
+    bool is_init = false;
 
-    map<size_t, size_t> blocks_FSA = { {16, 10}, {32, 10}, {64, 10}, {128, 10}, {256, 10}, {512, 10} };
-    map<size_t, void*> pools_FSA;
+    void* ptr_main = nullptr;
+    size_t total_size = 0;
 
+    struct FSA_Pool 
+    {
+        size_t size;
+        size_t count;
+        void* head = nullptr;         // Головной указатель на список свободных блоков
+
+        // Конструктор для удобной инициализации
+        FSA_Pool(size_t block_size, size_t count) : size(block_size), count(count) {}
+    };
+
+    array<FSA_Pool, 6> pools_FSA = { {
+        FSA_Pool(16, 10),
+        FSA_Pool(32, 10),
+        FSA_Pool(64, 10),
+        FSA_Pool(128, 10),
+        FSA_Pool(256, 10),
+        FSA_Pool(512, 10)
+    } };
+
+    struct Block_FSA 
+    {
 //#ifdef DEBUG
-    map<size_t, vector<void*>> occupied_FSA;
+        bool is_free = true;
 //#endif
+        Block_FSA* next;
+    };
 
-    // Структура описания блока для CA
     struct Block_CA
     {
-        bool is_free;      
-        size_t size;   
-        Block_CA* next;  
-        Block_CA* prev; 
+        bool is_free = true;      
+        size_t size = 0;   
+        Block_CA* next = nullptr;
+        Block_CA* prev = nullptr;
     };
 
-    Block_CA* head_of_list = nullptr; 
-    size_t memory_for_coalesce = 4096; 
+    Block_CA* head_CA = nullptr; 
+    size_t memory_CA = 4096; 
 
-    // Структура для описания блока, выделенного у ОС
     struct Block_OS
-    {
-        void* ptr;         
-        size_t size;        
+    {         
+        size_t size;
+        Block_OS* next = nullptr;
     };
 
+    Block_OS* head_OS = nullptr;
     size_t limit_to_call_os = 10 * 1024 * 1024;
-    vector<Block_OS> pools_OS;
 
     // Метод объединения соседних свободных блоков в CA
     // Если предыдущий или следующий блоки свободны, они объединяются с текущим для минимизации фрагментации
@@ -102,163 +124,136 @@ public:
 
     ~Memory_allocator()
     {
-        assert(!is_int && "Destroy must be called before destructor!");
+        assert(!is_init && "Destroy must be called before destructor!");
 
-        if (is_int)
+        if (is_init)
         {
             destroy();
         }
     }
 
-    // Инициализация менеджера памяти:
-    // 1. Инициализация пулов FSA: выделяется память для фиксированных блоков и формируется односвязный список
-    // 2. Инициализация CA: выделяется большой блок памяти, который становится головой двусвязного списка
+    // Инициализирует память для FSA и CA, выделяя общий блок
     void init()
     {
-        assert(!is_int && "Allocator already initialized!");
+        assert(!is_init && "Allocator already initialized!");
 
-        if (!is_int)
-        {
-            // Инициализация пулов FSA
-            for (const auto& [size, count] : blocks_FSA)
-            {
-                void* head = nullptr; // Начало списка свободных блоков
-
-                for (size_t i = 0; i < count; ++i)
-                {
-                    void* block = malloc(size);
-
-                    if (!block)
-                    {
-                        throw runtime_error("Memory allocation failed for FSA block");
-                    }
-
-                    // Сохраняем указатель на текущий "головной" блок в новом
-                    *reinterpret_cast<void**>(block) = head;
-                    head = block;
-                }
-
-                pools_FSA[size] = head; // Устанавливаем головной блок для текущего размера
-            }
-
-            // Инициализация списка CA
-            void* memory_CA = malloc(memory_for_coalesce);
-
-            if (!memory_CA) {
-                throw runtime_error("Memory allocation failed for Coalesced Allocator");
-            }
-
-            // Приводим указатель к типу Block_CA с помощью reinterpret_cast
-            // reinterpret_cast позволяет выполнять низкоуровневое преобразование типов
-            head_of_list = static_cast<Block_CA*>(memory_CA);
-            // Вычисляем размер доступной памяти
-            head_of_list->size = memory_for_coalesce - sizeof(Block_CA);
-            head_of_list->is_free = true;
-            head_of_list->next = nullptr;
-            head_of_list->prev = nullptr;
-
-
-            is_int = true;
+        if (is_init) {
+            return;
         }
+
+        // Рассчитываем общий объем памяти, необходимый для FSA и CA
+        size_t memory_FSA = 0;
+
+        for (const auto& pool : pools_FSA) {
+            memory_FSA += (sizeof(FSA_Pool) + (pool.size + sizeof(Block_FSA)) * pool.count);
+        }
+
+        total_size = memory_FSA + memory_CA;
+
+        // nullptr — адрес начала выделяемого блока памяти. Если передать nullptr, система сама выберет подходящий адрес
+        // total_size — размер памяти в байтах, который нужно выделить. Размер округляется до кратного размера страницы (обычно 4 КБ)
+        // MEM_RESERVE — резервирует виртуальную память без выделения физических страниц памяти
+        // Эта память не доступна до тех пор, пока не будет "закреплена" через MEM_COMMIT
+        // MEM_COMMIT — выделяет физические страницы памяти и связывает их с виртуальной памятью
+        // PAGE_READWRITE — устанавливает права доступа на память: чтение и запись разрешен
+        // Возвращает указатель на начало выделенного региона
+        ptr_main = VirtualAlloc(nullptr, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+        // Разделяем память на части: FSA и CA
+        uint8_t* current_ptr = reinterpret_cast<uint8_t*>(ptr_main);
+
+        // Инициализация FSA
+        for (auto& pool : pools_FSA)
+        {
+            pool.head = current_ptr;
+
+            // Разделяем память внутри пула на блоки
+            // Последний блок указывает на nullptr
+            Block_FSA* block = static_cast<Block_FSA*>(pool.head);
+
+            for (size_t i = 0; i < pool.count - 1; ++i)
+            {
+                // Приводим указатель к типу Block_FSA с помощью reinterpret_cast
+                // reinterpret_cast позволяет выполнять низкоуровневое преобразование типов
+                block->next = reinterpret_cast<Block_FSA*>(reinterpret_cast<uint8_t*>(block) + pool.size + sizeof(Block_FSA));
+                block = block->next;
+            }
+
+            current_ptr += (pool.size + sizeof(Block_FSA)) * pool.count;
+        }
+
+        // Инициализация CA
+        head_CA = reinterpret_cast<Block_CA*>(current_ptr);
+        // Вычисляем размер доступной памяти
+        head_CA->size = memory_CA - sizeof(Block_CA);
+
+        is_init = true;
     }
 
-    // Уничтожение аллокатора: освобождение памяти FSA, CA и ОС
+    // Уничтожает аллокатор, освобождая всю выделенную память
     void destroy()
     {
-        assert(is_int && "Allocator not initialized!");
+        assert(is_init && "Allocator not initialized!");
 
-        // Освобождение памяти FSA
-        for (auto& [size, head] : pools_FSA)
-        {
-            while (head)
-            {
-                void* next = *reinterpret_cast<void**>(head);   // Получаем указатель на следующий свободный блок
-                free(head);
-                head = next;
-            }
-        }
-        pools_FSA.clear();
+        VirtualFree(ptr_main, total_size, MEM_RELEASE);
 
-//#ifdef DEBUG
-        // Освобождение занятых блоков FSA
-        for (auto& [size, blocks] : occupied_FSA)
-        {
-            for (void* block : blocks)
-            {
-                if (block) {
-                    free(block);
-                }
-            }
-        }
-        occupied_FSA.clear();
-//#endif
-
-        // Освобождение памяти CA
-        Block_CA* current = head_of_list;
-
-        while (current)
-        {
-            Block_CA* next = current->next;
-
-            if (current->is_free)
-            {
-                free(current);
-            }
-
-            current = next;
+        for (auto& pool : pools_FSA) {
+            pool.head = nullptr;
         }
 
-        head_of_list = nullptr;
+        head_CA = nullptr;
 
-        // Освобождение памяти, выделенной у ОС
-        for (const Block_OS& block_os : pools_OS)
+        Block_OS* current_OS = head_OS;
+
+        while (current_OS)
         {
-            if (!VirtualFree(block_os.ptr, 0, MEM_RELEASE))
-            {
-                cerr << "VirtualFree failed with error: " << GetLastError() << "\n";
-            }
+            Block_OS* next = current_OS->next;
+
+            VirtualFree(current_OS, 0, MEM_RELEASE);
+
+            current_OS = next;
         }
 
-        pools_OS.clear();
+        head_OS = nullptr;
 
-
-        is_int = false;
+        is_init = false;
     }
 
-    // Алгоритм выделения памяти:
-    // 1. Попытка выделения из пулов FSA для фиксированных размеров
-    // 2. Если размер меньше лимита CA, ищется подходящий свободный блок в CA
-    //    Если он найден, возможно разбиение на два блока
-    // 3. Если запрос превышает лимит CA, память выделяется у ОС через VirtualAlloc
+    // Выделяет блок памяти заданного размера
+    // FSA: возвращает блок из пула фиксированного размера
+    // CA: возвращает блок из динамической памяти
+    // OS: выделяет блок через VirtualAlloc
     void* alloc(size_t size)
     {
-        assert(is_int && "Allocator not initialized!");
+        assert(is_init && "Allocator not initialized!");
 
         // Выравнивание размера на границу 8 байт
         size = (size + 7) & ~7; 
 
         // Если размер соответствует FSA, пытаемся взять блок из пула
-        // blocks_FSA.count(size) возвращает 1, если ключ size существует в blocks_FSA, и 0 в противном случае.
-        if (blocks_FSA.count(size) > 0)
+        if (size <= pools_FSA.back().size) 
         {
-            auto it = pools_FSA.find(size);
-
-            if (it != pools_FSA.end() && it->second)
+            for (auto& pool : pools_FSA) 
             {
-                void* block = it->second;                           // Головной блок
-                it->second = *reinterpret_cast<void**>(block);      // Следующий свободный блок
-
+                if (size <= pool.size) 
+                {
+                    if (pool.head) 
+                    {
+                        Block_FSA* block = static_cast<Block_FSA*>(pool.head);
+                        pool.head = block->next;  // Перемещаем голову на следующий блок
 //#ifdef DEBUG
-                occupied_FSA[size].push_back(block);
+                        block->is_free = false;
 //#endif
 
-                return block;
+                        return reinterpret_cast<void*>(block);
+                    }
+                }
             }
         }
         // Если размер подходит для CA
         else if (size <= limit_to_call_os)
         {
-            Block_CA* current = head_of_list;
+            Block_CA* current = head_CA;
 
             while (current)
             {
@@ -269,23 +264,26 @@ public:
                     // Разбиение блока, если остаток достаточно велик
                     if (current->size > size + sizeof(Block_CA))
                     {
-                        Block_CA* newBlock = reinterpret_cast<Block_CA*>(reinterpret_cast<char*>(current) + sizeof(Block_CA) + size);
+                        // Приводим указатель к типу Block_CA с помощью reinterpret_cast
+                        // reinterpret_cast позволяет выполнять низкоуровневое преобразование типов
+                        Block_CA* new_block = reinterpret_cast<Block_CA*>(reinterpret_cast<char*>(current) + sizeof(Block_CA) + size);
 
                         // Вычисляем размер нового блока
-                        newBlock->size = current->size - size - sizeof(Block_CA);
-                        newBlock->is_free = true;
-                        newBlock->next = current->next;
-                        newBlock->prev = current;
+                        new_block->size = current->size - size - sizeof(Block_CA);
+                        new_block->is_free = true;
+                        new_block->next = current->next;
+                        new_block->prev = current;
 
                         if (current->next)
                         {
-                            current->next->prev = newBlock;
+                            current->next->prev = new_block;
                         }
 
-                        current->next = newBlock;
+                        current->next = new_block;
                         current->size = size;
                     }
 
+                    // current + 1 используется, чтобы получить указатель на данные, которые находятся после метаданных блока
                     return reinterpret_cast<void*>(current + 1);
                 }
 
@@ -295,77 +293,60 @@ public:
         else
         {
             // Если размер превышает лимит CA, выделяем память у ОС
+            void* ptr = VirtualAlloc(nullptr, size + sizeof(Block_OS), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-            // nullptr — адрес начала выделяемого блока памяти. Если передать nullptr, система сама выберет подходящий адрес
-            // size — размер памяти в байтах, который нужно выделить. Размер округляется до кратного размера страницы (обычно 4 КБ)
-            // MEM_RESERVE — резервирует виртуальную память без выделения физических страниц памяти
-            // Эта память не доступна до тех пор, пока не будет "закреплена" через MEM_COMMIT
-            // MEM_COMMIT — выделяет физические страницы памяти и связывает их с виртуальной памятью
-            // PAGE_READWRITE — устанавливает права доступа на память: чтение и запись разрешен
-            // Возвращает указатель на начало выделенного региона
-            void* memory_os = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            Block_OS* block = static_cast<Block_OS*>(ptr);
+            block->size = size;
 
-            // Если вернулся nullptr, то память не выделилась. Для диагностики используется GetLastError, которая возвращает код ошибки
-            if (!memory_os)
+            if (head_OS == nullptr) {
+                head_OS = block;
+            }
+            else 
             {
-                cerr << "VirtualAlloc failed with error: " << GetLastError() << "\n";
+                Block_OS* current = head_OS;
 
-                return nullptr;
+                while (current->next) {
+                    current = current->next;
+                }
+
+                current->next = block;
             }
 
-            pools_OS.push_back({ memory_os, size });
-
-            return memory_os;
+            return ptr;
         }
 
         // Если память не удалось выделить
         return nullptr;
     }
-
-    // Алгоритм освобождения памяти:
-    // 1. Если указатель принадлежит пулу FSA, блок возвращается в начало соответствующего списка
-    // 2. Если указатель принадлежит памяти CA, блок помечается свободным, а затем объединяется с соседними
-    // 3. Если указатель принадлежит памяти ОС, память освобождается через VirtualFree
+ 
+    // Освобождает блок памяти:
+    // FSA: возвращает блок в пул
+    // CA: помечает блок как свободный и объединяет его с соседними
+    // OS: освобождает память через VirtualFree
     void free_(void* ptr)
     {
-        assert(is_int && "Allocator not initialized!");
+        assert(is_init && "Allocator not initialized!");
 
         if (!ptr)
         {
             return;
         }
 
-//#ifdef DEBUG
-        // Освобождение блока для FSA
-        for (auto& [size, occupied] : occupied_FSA) 
+        for (auto& pool : pools_FSA) 
         {
-            auto it = find(occupied.begin(), occupied.end(), ptr);
-
-            if (it != occupied.end())
+            // Проверка принадлежности к FSA
+            if (ptr >= pool.head && ptr < reinterpret_cast<void*>(reinterpret_cast<char*>(pool.head) + pool.count * (pool.size + sizeof(Block_FSA)))) 
             {
-                // erase —  способ удаления элементов из вектора
-                occupied.erase(it);
-
-            }
-        }
-//#endif
-
-        // Освобождение блока для FSA
-        for (auto& [size, head] : pools_FSA) 
-        {
-            // Попытаемся определить размер блока на основании переданного указателя и вернуть его в пул
-            if (reinterpret_cast<void**>(ptr) == &head) 
-            {
-                // Возвращаем блок в начало списка свободных блоков
-                *reinterpret_cast<void**>(ptr) = head;  // Указатель на предыдущую голову списка
-                head = ptr;                             // Новый головой списка становится освободившийся блок
+                Block_FSA* block = static_cast<Block_FSA*>(ptr);
+                block->next = static_cast<Block_FSA*>(pool.head);
+                pool.head = block;
 
                 return;
             }
         }
 
         // Проверка принадлежности к CA
-        if (ptr > head_of_list && ptr < reinterpret_cast<void*>(reinterpret_cast<char*>(head_of_list) + memory_for_coalesce))
+        if (ptr > head_CA && ptr < reinterpret_cast<void*>(reinterpret_cast<char*>(head_CA) + memory_CA))
         {
             Block_CA* block = reinterpret_cast<Block_CA*>(reinterpret_cast<char*>(ptr) - sizeof(Block_CA));     // Получаем метаинформацию блока
 
@@ -378,23 +359,28 @@ public:
             return;
         }
 
-        // Проверка принадлежности к памяти ОС
-        for (auto it = pools_OS.begin(); it != pools_OS.end(); ++it)
+        Block_OS* prev = nullptr;
+        Block_OS* current = head_OS;
+
+        while (current) 
         {
-            if (it->ptr == ptr)
+            // Проверка принадлежности к OS
+            if (reinterpret_cast<void*>(current + 1) == ptr) 
             {
-                // 0 — размер освобождаемого региона. Если передать 0, освобождается вся область, выделенная через VirtualAlloc (при использовании MEM_RELEASE)
-                // MEM_RELEASE — указывает, что мы освобождаем выделенную память. Память больше не доступна процессу
-                // Если функция возвращает FALSE, произошла ошибка. 
-                if (!VirtualFree(it->ptr, 0, MEM_RELEASE))
-                {
-                    cerr << "VirtualFree failed with error: " << GetLastError() << "\n";
+                if (prev) {
+                    prev->next = current->next;
+                }
+                else {
+                    head_OS = current->next;
                 }
 
-                pools_OS.erase(it);
+                VirtualFree(current, 0, MEM_RELEASE);
 
                 return;
             }
+
+            prev = current;
+            current = current->next;
         }
     }
 
@@ -404,107 +390,114 @@ public:
     {
         cout << "\nMemory statistics:\n****************************************\n\n";
 
+        size_t occupied_blocks;
+
         cout << "Fixed-size Memory Allocation:\n----------------------------------------\n";
 
-        for (const auto& [size, head] : pools_FSA)
+        for (const auto& pool : pools_FSA)
         {
-            size_t free_blocks = 0;
+            occupied_blocks = 0;
 
-            // Подсчет свободных блоков в списке
-            void* current = head;
+            Block_FSA* block = static_cast<Block_FSA*>(pool.head);
 
-            while (current)
+            while (block)
             {
-                ++free_blocks;
-                current = *reinterpret_cast<void**>(current); // Переход к следующему блоку
+                if (!block->is_free) {
+                    occupied_blocks++;
+                }
+
+                block = block->next;
             }
 
-            // Проверяем наличие ключа в occupied_FSA
-            size_t occupied_blocks = 0;
-            auto it = occupied_FSA.find(size);
-
-            if (it != occupied_FSA.end())
-            {
-                occupied_blocks = it->second.size(); // Количество занятых блоков
-            }
-
-            cout << "Size: " << size << ", Occupied: " << occupied_blocks << ", Free: " << free_blocks << "\n";
+            cout << "Size: " << pool.size << ", Free: " << pool.count - occupied_blocks << ", Occupied: " << occupied_blocks << "\n";
         }
 
         cout << "----------------------------------------\n\nCoalesce Allocation:\n----------------------------------------\n";
 
-        size_t blocks_free = 0, occupied_blocks = 0;
-        Block_CA* current = head_of_list;
+        occupied_blocks = 0;
+        size_t free_blocks = 0;
 
-        while (current)
+        Block_CA* current_CA = head_CA;
+
+        while (current_CA)
         {
-            if (current->is_free) {
-                blocks_free++;
+            if (current_CA->is_free) {
+                free_blocks++;
             }
             else {
                 occupied_blocks++;
             }
 
+            current_CA = current_CA->next;
+        }
+
+        cout << "Free: " << free_blocks << ", Occupied: " << occupied_blocks << "\n";
+
+        cout << "----------------------------------------\n\nOS Allocations:\n----------------------------------------\n";
+
+        occupied_blocks = 0;
+
+        Block_OS* current = head_OS;
+
+        while (current)
+        {
+            ++occupied_blocks;
+
             current = current->next;
         }
 
-        cout << "Occupied: " << occupied_blocks << ", Free: " << blocks_free << "\n";
+        cout << "Occupied: " << occupied_blocks << "\n";
 
-        cout << "----------------------------------------\n\nOS Allocations:\n----------------------------------------\n";
-        cout << "Occupied blocks: " << pools_OS.size() << "\n";
         cout << "----------------------------------------\n";
 
         cout << "\n****************************************\n";
     }
 
-    // Вывод адреса и размеры всех выделенных блоков для FSA, CA и ОС
+    // Вывод адреса и размеры всех выделенных блоков для FSA, CA и OS
     void dump_blocks() const
     {
         cout << "\nAllocated blocks:\n****************************************\n\n";
 
-
         cout << "Fixed-size Memory Allocation:\n----------------------------------------\n";
 
-        for (const auto& [size, head] : pools_FSA)
+        for (const auto& pool : pools_FSA)
         {
-            // Проверяем наличие ключа в occupied_FSA
-            auto it = occupied_FSA.find(size);
+            size_t free_blocks = 0;
+            Block_FSA* block = static_cast<Block_FSA*>(pool.head);
 
-            if (it != occupied_FSA.end())
+            while (block)
             {
-                const vector<void*>& occupied_blocks = it->second;
-
-                if (occupied_blocks.size() > 0)
-                {
-                    for (void* block : occupied_blocks)
-                    {
-                        cout << "Block at " << block << ", size: " << size << "\n";
-                    }
-                }
+                free_blocks++;
+                block = block->next;
             }
+
+            cout << "Pool size: " << pool.size << ", Free blocks: " << free_blocks << "\n";
         }
 
         cout << "----------------------------------------\n\nCoalesce Allocation:\n----------------------------------------\n";
 
-        Block_CA* current = head_of_list;
+        Block_CA* current_CA = head_CA;
 
-        while (current)
+        while (current_CA)
         {
-            if (!current->is_free) {
-                cout << "Block at " << current << ", size: " << current->size << "\n";
+            if (!current_CA->is_free) {
+                cout << "Block at " << current_CA << ", size: " << current_CA->size << "\n";
             }
-            current = current->next;
+            current_CA = current_CA->next;
         }
-
 
         cout << "----------------------------------------\n\nOS Allocations:\n----------------------------------------\n";
 
-        for (const auto& [ptr, size] : pools_OS) {
-            cout << "  Block at " << ptr << ", size: " << size << "\n";
+        Block_OS* current_OS = head_OS;
+
+        while (current_OS)
+        {
+            cout << "Block at " << current_OS << ", size: " << current_OS->size << "\n";
+
+            current_OS = current_OS->next;
         }
 
         cout << "----------------------------------------\n";
-
 
         cout << "\n****************************************\n";
     }
