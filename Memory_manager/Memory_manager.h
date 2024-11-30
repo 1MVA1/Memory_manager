@@ -35,13 +35,12 @@ private:
     bool is_init = false;
 
     void* ptr_main = nullptr;
-    size_t total_size = 0;
 
     struct FSA_Pool 
     {
         size_t size;
         size_t count;
-        void* head = nullptr;         // Головной указатель на список свободных блоков
+        void* head; 
 
         // Конструктор для удобной инициализации
         FSA_Pool(size_t block_size, size_t count) : size(block_size), count(count) {}
@@ -56,20 +55,16 @@ private:
         FSA_Pool(512, 10)
     } };
 
-    struct Block_FSA 
-    {
-//#ifdef DEBUG
-        bool is_free = true;
-//#endif
+    struct Block_FSA {
         Block_FSA* next;
     };
 
     struct Block_CA
     {
-        bool is_free = true;      
-        size_t size = 0;   
-        Block_CA* next = nullptr;
-        Block_CA* prev = nullptr;
+        bool is_free;      
+        size_t size;   
+        Block_CA* next;
+        Block_CA* prev;
     };
 
     Block_CA* head_CA = nullptr; 
@@ -78,7 +73,7 @@ private:
     struct Block_OS
     {         
         size_t size;
-        Block_OS* next = nullptr;
+        Block_OS* next;
     };
 
     Block_OS* head_OS = nullptr;
@@ -148,8 +143,6 @@ public:
             memory_FSA += (sizeof(FSA_Pool) + (pool.size + sizeof(Block_FSA)) * pool.count);
         }
 
-        total_size = memory_FSA + memory_CA;
-
         // nullptr — адрес начала выделяемого блока памяти. Если передать nullptr, система сама выберет подходящий адрес
         // total_size — размер памяти в байтах, который нужно выделить. Размер округляется до кратного размера страницы (обычно 4 КБ)
         // MEM_RESERVE — резервирует виртуальную память без выделения физических страниц памяти
@@ -157,9 +150,11 @@ public:
         // MEM_COMMIT — выделяет физические страницы памяти и связывает их с виртуальной памятью
         // PAGE_READWRITE — устанавливает права доступа на память: чтение и запись разрешен
         // Возвращает указатель на начало выделенного региона
-        ptr_main = VirtualAlloc(nullptr, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        ptr_main = VirtualAlloc(nullptr, memory_FSA + memory_CA, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
         // Разделяем память на части: FSA и CA
+        // uint8_t — это тип беззнакового целого числа размером 1 байт (8 бит), который идеально подходит для работы с адресами и смещениями в памяти
+        // Использование uint8_t* позволяет выполнять арифметические операции с указателями на уровне отдельных байтов
         uint8_t* current_ptr = reinterpret_cast<uint8_t*>(ptr_main);
 
         // Инициализация FSA
@@ -186,6 +181,9 @@ public:
         head_CA = reinterpret_cast<Block_CA*>(current_ptr);
         // Вычисляем размер доступной памяти
         head_CA->size = memory_CA - sizeof(Block_CA);
+        head_CA->is_free = true;
+        head_CA->next = nullptr;
+        head_CA->prev = nullptr;
 
         is_init = true;
     }
@@ -195,7 +193,9 @@ public:
     {
         assert(is_init && "Allocator not initialized!");
 
-        VirtualFree(ptr_main, total_size, MEM_RELEASE);
+        // ptr_main - указатель на начало региона памяти, который нужно освободить
+        // MEM_RELEASE - указывает, что нужно освободить весь регион памяти (поэтому 2 параметр игнорируется, можно отправить даже 0)
+        VirtualFree(ptr_main, 0, MEM_RELEASE);
 
         for (auto& pool : pools_FSA) {
             pool.head = nullptr;
@@ -241,11 +241,9 @@ public:
                     {
                         Block_FSA* block = static_cast<Block_FSA*>(pool.head);
                         pool.head = block->next;  // Перемещаем голову на следующий блок
-//#ifdef DEBUG
-                        block->is_free = false;
-//#endif
 
-                        return reinterpret_cast<void*>(block);
+                        // block + 1 используется, чтобы получить указатель на данные, которые находятся после метаданных блока
+                        return reinterpret_cast<void*>(block + 1);
                     }
                 }
             }
@@ -385,36 +383,15 @@ public:
     }
 
 //#ifdef DEBUG
-    // Вывод количества занятых и свободных блоков для FSA, CA и ОС
+    // Вывод количества занятых и свободных блоков для CA и ОС
+    // Для FSA надо заводить списки занятых для каждого размера, но мне лень уже
     void dump_stat() const
     {
         cout << "\nMemory statistics:\n****************************************\n\n";
 
-        size_t occupied_blocks;
-
-        cout << "Fixed-size Memory Allocation:\n----------------------------------------\n";
-
-        for (const auto& pool : pools_FSA)
-        {
-            occupied_blocks = 0;
-
-            Block_FSA* block = static_cast<Block_FSA*>(pool.head);
-
-            while (block)
-            {
-                if (!block->is_free) {
-                    occupied_blocks++;
-                }
-
-                block = block->next;
-            }
-
-            cout << "Size: " << pool.size << ", Free: " << pool.count - occupied_blocks << ", Occupied: " << occupied_blocks << "\n";
-        }
-
         cout << "----------------------------------------\n\nCoalesce Allocation:\n----------------------------------------\n";
 
-        occupied_blocks = 0;
+        size_t occupied_blocks = 0;
         size_t free_blocks = 0;
 
         Block_CA* current_CA = head_CA;
@@ -467,11 +444,10 @@ public:
 
             while (block)
             {
-                free_blocks++;
+                cout << "Block at " << block << ", size: " << pool.size << "\n";
+
                 block = block->next;
             }
-
-            cout << "Pool size: " << pool.size << ", Free blocks: " << free_blocks << "\n";
         }
 
         cout << "----------------------------------------\n\nCoalesce Allocation:\n----------------------------------------\n";
